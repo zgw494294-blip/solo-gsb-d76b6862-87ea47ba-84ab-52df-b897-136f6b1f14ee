@@ -66,6 +66,20 @@ clock 非零分量所指事件**；依赖会跨 key 延伸，因此闭包中可�
 **404**，非法 `keys`（缺失、为空、含空串/非字符串或有重复）返回 **422**；查询
 不改动历史、导入会话与任何旧接口。
 
+最后还有一个**只读事件因果关系**接口
+（`POST /api/histories/{id}/event-relation`）：解释同一份已提交历史中**任意两条
+事件**的因果关系，**允许跨 key** 比较。请求体携带 `first`、`second` 两个
+`{replica_id, seq}` 标识（`replica_id` 非空、`seq` 为严格正整数、拒绝布尔值），
+响应 `relation` 以 **first 相对 second** 的方向为准：`before`/`after`（因果
+先/后）、`concurrent`（互不可比）或 `same`（同一事件）。先后关系附 `chain`：
+从**较早到较晚**的事件标识链，链上后一事件**直接依赖**前一事件（本副本
+`seq - 1` 或其他副本 clock 非零分量所指事件），取**边数最少**、再按
+`(replica_id, seq)` 序列**字典序最小**（`seq` 按数值比较）的链；`same` 返回
+单节点链；`concurrent` 时链为空，并各给出一个**自身 clock 大于对方**的分量及
+双方数值（多个候选取副本 ID 最小者）。关系与证据取自**同一已提交历史**（不含
+会话暂存），查询不改动历史或会话；历史或事件不存在返回 **404**，标识非法返回
+**422**。
+
 ## 启动
 
 需要 Docker 与 Docker Compose v2（`docker compose` 子命令）。
@@ -99,6 +113,7 @@ docker compose down
 | 提交会话（汇入并封闭） | `POST http://localhost:8000/api/histories/{id}/import-sessions/{sid}/commit` |
 | 查询仍需补取的缺口区间（只读，不提交） | `GET http://localhost:8000/api/histories/{id}/import-sessions/{sid}/missing-ranges` |
 | 提取指定键的因果证据批次（只读，可直接重放） | `POST http://localhost:8000/api/histories/{id}/evidence-batch` |
+| 解释两条事件的因果关系（只读，可跨 key） | `POST http://localhost:8000/api/histories/{id}/event-relation` |
 | Swagger UI | <http://localhost:8000/docs> |
 | OpenAPI 文档 | <http://localhost:8000/openapi.json> |
 
@@ -562,6 +577,7 @@ SQLite 文件，路径由环境变量 `HISTORY_DB_PATH` 决定；`docker compose
 | `POST` | `/api/histories/{id}/resolve-conflict` | 按 ID 提交原冲突处理参数（`key`、`replica_id`、`versions`、`put`/`delete`），不再传整个批次 |
 | `GET` | `/api/histories/{id}/withdraw-preview?replica_id=...&seq=...` | **只读**预演撤除一条事件的波及范围（撤除集合、剩余事件、前后裁决），不改动历史 |
 | `POST` | `/api/histories/{id}/evidence-batch` | **只读**提取指定 key 列表的完整写入记录及其递归因果闭包，返回可直接重放的原格式批次 |
+| `POST` | `/api/histories/{id}/event-relation` | **只读**解释两条事件的因果关系（`before`/`after`/`concurrent`/`same`）及证据链，可跨 key |
 
 汇入规则：
 
@@ -1635,6 +1651,219 @@ curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/evidence-batch" \
 
 整个查询过程不产生任何写入：再 `GET` 历史，事件与裁决均与提取前一致；已有的
 导入会话（开放或封闭）及其暂存内容也不受影响。
+
+## 事件因果关系接口 `POST /api/histories/{id}/event-relation`
+
+解释**同一份已提交持久历史**中任意两条事件的因果关系，**允许跨 key** 比较。
+接口为**只读**：关系与证据取自同一次读取的已提交历史（**不含**导入会话中尚未
+提交的暂存事件），不改动历史、导入会话与任何旧接口，可重复查询。
+
+请求体携带两个事件标识 `first`、`second`，各为 `{replica_id, seq}`：
+
+```json
+{
+  "first": {"replica_id": "r2", "seq": 1},
+  "second": {"replica_id": "r1", "seq": 2}
+}
+```
+
+- `replica_id`：非空字符串；
+- `seq`：正整数（严格校验：拒绝布尔值、字符串、浮点数、0 与负数）。
+
+响应的 `relation` 以 **first 相对 second** 的方向为准：
+
+- `before` / `after`：first 在因果上先于 / 后于 second（向量时钟严格偏序）。
+  响应附 `chain`：从**较早事件到较晚事件**的事件标识链（与方向无关——`after`
+  时同样从 second 到 first）。链上后一事件**直接依赖**前一事件，即前一事件是
+  后一事件**本副本的 `seq - 1`**，或是后一事件 clock 中**其他副本非零分量**
+  所指的事件。存在多条链时取**边数最少**者；仍并列时取标识 `(replica_id, seq)`
+  序列**字典序最小**者（`replica_id` 按字符串、`seq` 按数值比较）。
+- `concurrent`：两者互不可比。`chain` 为空数组；`first_ahead` 与
+  `second_ahead` 各给出一个**自身 clock 大于对方**的分量及双方在该分量上的
+  数值（`first_value`/`second_value`）；有多个候选分量时取**副本 ID 最小**者。
+- `same`：两个标识指向同一事件，`chain` 为单节点链。
+
+状态码：
+
+- **200**：返回 `{"id", "relation", "chain", ...}`；
+- **404**：历史不存在（`history_not_found`），或任一标识在历史中没有对应事件
+  （`event_not_found`，先检查 `first` 再检查 `second`）；
+- **422**：标识非法（缺字段、空 `replica_id`、`seq` 为布尔/字符串/非正整数、
+  多余字段等）；请求体校验先于历史查询，历史不存在时非法请求体仍返回 422。
+
+### 24. 跨键先后：依赖链作为证据
+
+先创建一份三副本历史：`r1/1` 写 key `a`；`r2/1` 同步过 `r1/1` 后写**另一个
+key** `dep`；`r1/2` 依赖本副本上一事件与 `r2/1`，把 `a` 改成 `"a2"`；`r2/2`
+再依赖 `r1/2` 写 `dep`；`r3/1` 在 key `other` 上完全离线并发写入：
+
+```bash
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2", "r3"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "a", "put": "a1",
+       "clock": {"r1": 1, "r2": 0, "r3": 0}},
+      {"replica_id": "r2", "seq": 1, "key": "dep", "put": "d1",
+       "clock": {"r1": 1, "r2": 1, "r3": 0}},
+      {"replica_id": "r1", "seq": 2, "key": "a", "put": "a2",
+       "clock": {"r1": 2, "r2": 1, "r3": 0}},
+      {"replica_id": "r2", "seq": 2, "key": "dep", "put": "d2",
+       "clock": {"r1": 2, "r2": 2, "r3": 0}},
+      {"replica_id": "r3", "seq": 1, "key": "other", "put": "z",
+       "clock": {"r1": 0, "r2": 0, "r3": 1}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+```
+
+比较 `dep` 上的 `r2/1` 与 `a` 上的 `r1/2`——**跨 key** 也有因果关系：
+`r1/2` 的 clock 中 `r2 = 1` 直接指向 `r2/1`，因此 `r2/1` 先于 `r1/2`，证据链
+就是这条直接依赖边：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r2", "seq": 1},
+       "second": {"replica_id": "r1", "seq": 2}}'
+```
+
+```json
+{
+  "id": "0df8…",
+  "relation": "before",
+  "chain": [
+    {"replica_id": "r2", "seq": 1},
+    {"replica_id": "r1", "seq": 2}
+  ]
+}
+```
+
+方向以 `first` 为准：交换两个标识得到 `after`，但链仍从**较早**的 `r2/1` 到
+**较晚**的 `r1/2`：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r1", "seq": 2},
+       "second": {"replica_id": "r2", "seq": 1}}'
+```
+
+```json
+{
+  "id": "0df8…",
+  "relation": "after",
+  "chain": [
+    {"replica_id": "r2", "seq": 1},
+    {"replica_id": "r1", "seq": 2}
+  ]
+}
+```
+
+从 `r1/1` 到 `r2/2` 有两条等长（2 条边）的依赖链——经 `r1/2` 或经 `r2/1`；
+取边数最少后仍并列，按标识序列字典序取较小者（第二节点 `("r1", 2)` 小于
+`("r2", 1)`）：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r1", "seq": 1},
+       "second": {"replica_id": "r2", "seq": 2}}'
+```
+
+```json
+{
+  "id": "0df8…",
+  "relation": "before",
+  "chain": [
+    {"replica_id": "r1", "seq": 1},
+    {"replica_id": "r1", "seq": 2},
+    {"replica_id": "r2", "seq": 2}
+  ]
+}
+```
+
+同一事件返回 `same` 与单节点链：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r3", "seq": 1},
+       "second": {"replica_id": "r3", "seq": 1}}'
+```
+
+```json
+{
+  "id": "0df8…",
+  "relation": "same",
+  "chain": [{"replica_id": "r3", "seq": 1}]
+}
+```
+
+### 25. 同值并发：空链与双方各自领先的分量
+
+两个副本并发地把同一个 key 写成**相同的值**（裁决上仍是冲突），因果关系为
+`concurrent`：
+
+```bash
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r2", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 0, "r2": 1}},
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r1", "seq": 1},
+       "second": {"replica_id": "r2", "seq": 1}}'
+```
+
+`chain` 为空；`first_ahead`/`second_ahead` 各给出一个自身 clock 严格大于对方
+的分量及双方数值（`first` 在 `r1` 分量上 1 > 0，`second` 在 `r2` 分量上
+1 > 0）：
+
+```json
+{
+  "id": "f82c…",
+  "relation": "concurrent",
+  "chain": [],
+  "first_ahead": {"replica_id": "r1", "first_value": 1, "second_value": 0},
+  "second_ahead": {"replica_id": "r2", "first_value": 0, "second_value": 1}
+}
+```
+
+错误示例：
+
+```bash
+# 历史不存在 -> 404 history_not_found
+curl -sS -i -X POST \
+  http://localhost:8000/api/histories/00000000000000000000000000000000/event-relation \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r1", "seq": 1},
+       "second": {"replica_id": "r2", "seq": 1}}'
+
+# 事件不存在（r1 没有 seq 9）-> 404 event_not_found
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r1", "seq": 9},
+       "second": {"replica_id": "r2", "seq": 1}}'
+
+# seq 为布尔值（或 0、负数、字符串、空 replica_id）-> 422
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r1", "seq": true},
+       "second": {"replica_id": "r2", "seq": 1}}'
+```
+
+整个查询过程不产生任何写入：再 `GET` 历史，事件与裁决均与查询前一致；暂存在
+导入会话中、尚未提交的事件不参与比较（按暂存事件的标识查询会得到 404
+`event_not_found`）。
 
 ## 本地开发（不使用 Docker）
 
