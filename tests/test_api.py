@@ -3523,3 +3523,332 @@ def test_evidence_batch_replica_ids_keep_eventless_replica_and_clock_components(
     assert all(set(e["clock"]) == {"r1", "r2", "r3"} for e in data["events"])
     assert client.post("/api/resolve", json=data).status_code == 200
 
+
+
+# ---------------------------------------------------------------------------
+# Causal relation between two events of one committed history
+# ---------------------------------------------------------------------------
+
+
+def hist_relation(hid, first, second):
+    return client.post(
+        f"/api/histories/{hid}/relation",
+        json={"first": first, "second": second},
+    )
+
+
+def ref(replica_id, seq):
+    return {"replica_id": replica_id, "seq": seq}
+
+
+def relation_seed_events():
+    # r1/1 (key a) is the common ancestor; r2/1 (key dep) synced it -- a
+    # cross-key dependency; r1/2 (key a) depends on r1/1 and r2/1; r2/2
+    # (key b) and r2/3 (key c) continue r2's chain, r2/3 also pointing back
+    # at r1/2 through its clock.
+    return [
+        ev("r1", 1, "a", put="a1", clock={"r1": 1, "r2": 0}),
+        ev("r2", 1, "dep", put="d1", clock={"r1": 1, "r2": 1}),
+        ev("r1", 2, "a", put="a2", clock={"r1": 2, "r2": 1}),
+        ev("r2", 2, "b", put="b2", clock={"r1": 2, "r2": 2}),
+        ev("r2", 3, "c", put="c3", clock={"r1": 2, "r2": 3}),
+    ]
+
+
+def create_relation_history():
+    r = hist_create(["r1", "r2"], relation_seed_events())
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def test_relation_before_cross_key_direct_clock_edge():
+    hid = create_relation_history()
+
+    # r1/1 (key a) is directly referenced by r2/1's clock (key dep): a
+    # one-edge chain across keys.
+    r = hist_relation(hid, ref("r1", 1), ref("r2", 1))
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "id": hid,
+        "relation": "before",
+        "chain": [ref("r1", 1), ref("r2", 1)],
+    }
+
+    # r2/1 (key dep) is directly referenced by r1/2's clock (key a).
+    r = hist_relation(hid, ref("r2", 1), ref("r1", 2))
+    assert r.status_code == 200, r.text
+    assert r.json()["relation"] == "before"
+    assert r.json()["chain"] == [ref("r2", 1), ref("r1", 2)]
+
+
+def test_relation_before_chain_prefers_fewest_edges():
+    hid = create_relation_history()
+
+    # r1/1 -> r2/3: the own-replica path r1/1 -> r2/1 -> r2/2 -> r2/3 takes
+    # three edges, but r2/3's clock points back at r1/2, so the shortest
+    # chain hops r1/1 -> r1/2 -> r2/3 in two edges.
+    r = hist_relation(hid, ref("r1", 1), ref("r2", 3))
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "id": hid,
+        "relation": "before",
+        "chain": [ref("r1", 1), ref("r1", 2), ref("r2", 3)],
+    }
+
+
+def test_relation_chain_tie_breaks_by_lexicographic_identity_sequence():
+    hid = create_relation_history()
+
+    # r1/1 -> r2/2 has two two-edge chains: via r1/2 and via r2/1.  Both
+    # start at r1/1 and end at r2/2, so the second node decides:
+    # ("r1", 2) < ("r2", 1) because replica_id compares first.
+    r = hist_relation(hid, ref("r1", 1), ref("r2", 2))
+    assert r.status_code == 200, r.text
+    assert r.json()["chain"] == [ref("r1", 1), ref("r1", 2), ref("r2", 2)]
+
+
+def test_relation_after_returns_chain_from_earlier_to_later():
+    hid = create_relation_history()
+
+    # Same pair as the before case, swapped: the relation flips to "after"
+    # but the chain still runs from the earlier event to the later one.
+    r = hist_relation(hid, ref("r2", 3), ref("r1", 1))
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "id": hid,
+        "relation": "after",
+        "chain": [ref("r1", 1), ref("r1", 2), ref("r2", 3)],
+    }
+
+
+def test_relation_same_event_returns_single_node_chain():
+    hid = create_relation_history()
+
+    r = hist_relation(hid, ref("r2", 2), ref("r2", 2))
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "id": hid,
+        "relation": "same",
+        "chain": [ref("r2", 2)],
+    }
+
+
+def test_relation_concurrent_same_value_returns_clock_evidence():
+    # The two branches put the same value; they are still concurrent.
+    hid = hist_create(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "name", put="alice", clock={"r1": 1, "r2": 0}),
+            ev("r2", 1, "name", put="alice", clock={"r1": 0, "r2": 1}),
+        ],
+    ).json()["id"]
+
+    r = hist_relation(hid, ref("r1", 1), ref("r2", 1))
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "id": hid,
+        "relation": "concurrent",
+        "chain": [],
+        "evidence": {
+            "first_greater": {"replica_id": "r1", "first": 1, "second": 0},
+            "second_greater": {"replica_id": "r2", "first": 0, "second": 1},
+        },
+    }
+
+    # Swapping first/second swaps the two evidence sides.
+    r = hist_relation(hid, ref("r2", 1), ref("r1", 1))
+    assert r.json()["evidence"] == {
+        "first_greater": {"replica_id": "r2", "first": 1, "second": 0},
+        "second_greater": {"replica_id": "r1", "first": 0, "second": 1},
+    }
+
+
+def test_relation_concurrent_evidence_picks_smallest_replica_id():
+    # r2/1 synced r3/1, so its clock exceeds r1/1's on two components
+    # (r2 and r3); the evidence cites the smallest such replica ID.
+    hid = hist_create(
+        ["r1", "r2", "r3"],
+        [
+            ev("r3", 1, "x", put="x", clock={"r1": 0, "r2": 0, "r3": 1}),
+            ev("r2", 1, "y", put="y", clock={"r1": 0, "r2": 1, "r3": 1}),
+            ev("r1", 1, "z", put="z", clock={"r1": 1, "r2": 0, "r3": 0}),
+        ],
+    ).json()["id"]
+
+    r = hist_relation(hid, ref("r2", 1), ref("r1", 1))
+    assert r.status_code == 200, r.text
+    assert r.json()["relation"] == "concurrent"
+    assert r.json()["chain"] == []
+    assert r.json()["evidence"] == {
+        "first_greater": {"replica_id": "r2", "first": 1, "second": 0},
+        "second_greater": {"replica_id": "r1", "first": 0, "second": 1},
+    }
+
+
+def test_relation_unknown_history_is_404():
+    r = hist_relation("0" * 32, ref("r1", 1), ref("r2", 1))
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "history_not_found"
+
+
+def test_relation_unknown_event_is_404():
+    hid = create_relation_history()
+
+    # first event missing.
+    r = hist_relation(hid, ref("r1", 9), ref("r2", 1))
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "event_not_found"
+
+    # second event missing.
+    r = hist_relation(hid, ref("r1", 1), ref("r2", 9))
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "event_not_found"
+
+    # A replica_id outside the history's replica set is an unknown event,
+    # not a 422: the reference itself is well-formed.
+    r = hist_relation(hid, ref("r9", 1), ref("r1", 1))
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "event_not_found"
+
+
+def test_relation_invalid_refs_are_422():
+    hid = create_relation_history()
+
+    # Boolean seq is rejected (not coerced to 1).
+    r = hist_relation(hid, {"replica_id": "r1", "seq": True}, ref("r2", 1))
+    assert r.status_code == 422, r.text
+
+    # seq below the minimum of 1.
+    r = hist_relation(hid, ref("r1", 0), ref("r2", 1))
+    assert r.status_code == 422, r.text
+
+    # Non-integer seq (string and float).
+    r = hist_relation(hid, {"replica_id": "r1", "seq": "1"}, ref("r2", 1))
+    assert r.status_code == 422, r.text
+    r = hist_relation(hid, {"replica_id": "r1", "seq": 1.5}, ref("r2", 1))
+    assert r.status_code == 422, r.text
+
+    # Empty replica_id.
+    r = hist_relation(hid, {"replica_id": "", "seq": 1}, ref("r2", 1))
+    assert r.status_code == 422, r.text
+
+    # Missing fields, non-object reference, extra fields.
+    r = client.post(
+        f"/api/histories/{hid}/relation", json={"first": ref("r1", 1)}
+    )
+    assert r.status_code == 422, r.text
+    r = client.post(
+        f"/api/histories/{hid}/relation",
+        json={"first": "r1/1", "second": ref("r2", 1)},
+    )
+    assert r.status_code == 422, r.text
+    r = client.post(
+        f"/api/histories/{hid}/relation",
+        json={"first": ref("r1", 1), "second": ref("r2", 1), "extra": 1},
+    )
+    assert r.status_code == 422, r.text
+
+    # Schema 422 takes precedence over the history lookup.
+    r = hist_relation("0" * 32, {"replica_id": "r1", "seq": True}, ref("r2", 1))
+    assert r.status_code == 422, r.text
+
+
+def test_relation_reads_merges_and_conflict_commits():
+    # The relation is computed over the latest committed state: merged
+    # events and committed resolution events are visible.
+    hid = create_conflict_history()
+    assert (
+        hist_commit(
+            hid,
+            key="name",
+            writer="r1",
+            versions=[ref("r1", 1), ref("r2", 1)],
+            put="chosen",
+        ).status_code
+        == 200
+    )
+    assert (
+        hist_merge(
+            hid, [ev("r2", 2, "name", put="bob2", clock={"r1": 0, "r2": 2})]
+        ).status_code
+        == 200
+    )
+
+    # The committed resolution r1/2 (clock {r1: 2, r2: 1}) directly depends
+    # on both conflict branches.
+    r = hist_relation(hid, ref("r2", 1), ref("r1", 2))
+    assert r.json()["relation"] == "before"
+    assert r.json()["chain"] == [ref("r2", 1), ref("r1", 2)]
+
+    # The merged r2/2 (clock {r1: 0, r2: 2}) is concurrent with r1/2.
+    r = hist_relation(hid, ref("r2", 2), ref("r1", 2))
+    assert r.json()["relation"] == "concurrent"
+    assert r.json()["evidence"] == {
+        "first_greater": {"replica_id": "r2", "first": 2, "second": 1},
+        "second_greater": {"replica_id": "r1", "first": 0, "second": 2},
+    }
+
+
+def test_relation_ignores_staged_session_events():
+    # Staged (uncommitted) events are invisible to the relation query.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="v", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+    assert (
+        session_append(
+            hid, sid, [ev("r1", 2, "k", put="w", clock={"r1": 2, "r2": 0})]
+        ).status_code
+        == 200
+    )
+
+    r = hist_relation(hid, ref("r1", 1), ref("r1", 2))
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "event_not_found"
+
+    # Once the session is committed the same query sees the event.
+    assert session_commit(hid, sid).status_code == 200
+    r = hist_relation(hid, ref("r1", 1), ref("r1", 2))
+    assert r.status_code == 200
+    assert r.json()["relation"] == "before"
+    assert r.json()["chain"] == [ref("r1", 1), ref("r1", 2)]
+
+
+def test_relation_is_read_only_and_repeatable():
+    hid = create_relation_history()
+    sid = create_session(hid)
+    before_history = hist_get(hid).json()
+    before_session = session_get(hid, sid).json()
+
+    first = hist_relation(hid, ref("r1", 1), ref("r2", 3))
+    assert first.status_code == 200
+    assert hist_relation(hid, ref("r1", 1), ref("r2", 3)).json() == first.json()
+    # Repeated queries, including failing ones, change nothing.
+    hist_relation(hid, ref("r1", 1), ref("r2", 9))
+    hist_relation(hid, {"replica_id": "r1", "seq": True}, ref("r2", 1))
+    assert hist_get(hid).json() == before_history
+    assert session_get(hid, sid).json() == before_session
+
+
+def test_relation_long_own_replica_chain_keeps_numeric_seq_order():
+    # A ten-event own-replica chain: the only dependency path from r1/1 to
+    # r1/10 walks every predecessor, and seqs stay numeric (1..10) in the
+    # chain -- never string-ordered.
+    events = [
+        ev("r1", n, "k", put=f"v{n}", clock={"r1": n, "r2": 0})
+        for n in range(1, 11)
+    ]
+    events.append(ev("r2", 1, "k", put="w", clock={"r1": 10, "r2": 1}))
+    hid = hist_create(["r1", "r2"], events).json()["id"]
+
+    r = hist_relation(hid, ref("r1", 1), ref("r1", 10))
+    assert r.status_code == 200, r.text
+    assert r.json()["relation"] == "before"
+    assert r.json()["chain"] == [ref("r1", n) for n in range(1, 11)]
+
+    # r2/1's clock points at r1/10, so the chain crosses replicas at the top.
+    r = hist_relation(hid, ref("r1", 1), ref("r2", 1))
+    assert r.json()["chain"] == [ref("r1", n) for n in range(1, 11)] + [
+        ref("r2", 1)
+    ]

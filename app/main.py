@@ -93,12 +93,33 @@ selected keys' verdicts over the batch equal their verdicts over the whole
 history; an auxiliary key's verdict may differ (it only supplies dependency
 evidence).  Unknown history or a selected key with no event is 404; an illegal
 keys list is 422.  The query is read-only.
+
+A read-only relation endpoint (/api/histories/{id}/relation) explains the
+causal relation between any two events of one committed history, across keys:
+the request carries two {replica_id, seq} references (``first`` and
+``second``; replica_id non-empty, seq a positive integer -- booleans
+rejected) and the response tells whether the first event is ``before`` or
+``after`` the second, ``concurrent`` with it, or the ``same`` event.  A
+before/after answer attaches a chain of event identifiers from the earlier to
+the later event in which every event directly depends on its predecessor
+(the previous event on its own replica, or the event another replica's
+non-zero clock component points at); among all such chains the one with the
+fewest edges wins, ties broken by the lexicographically smallest
+(replica_id, seq) sequence with seq compared numerically.  A concurrent
+answer carries an empty chain plus, for each side, one clock component where
+its own clock exceeds the other side's (the smallest replica ID when several
+qualify) together with both values; a same answer carries a single-node
+chain.  Relation and evidence are read from one committed snapshot of the
+history -- staged import-session events are invisible -- and the query never
+modifies the history or any session.  An unknown history or event is 404; an
+illegal reference is 422.
 """
 
 from __future__ import annotations
 
 import json
 import uuid
+from collections import deque
 from typing import Annotated, Optional
 
 from fastapi import FastAPI, Query, Request
@@ -327,6 +348,41 @@ class StageEventsRequest(BaseModel):
             ),
         ),
     ]
+
+
+class EventRef(BaseModel):
+    """A (replica_id, seq) reference to one event of a history.
+
+    ``replica_id`` must be non-empty and ``seq`` a positive integer; the
+    strict integer rejects booleans, strings and floats (all 422).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    replica_id: Annotated[
+        str,
+        Field(min_length=1, description="Non-empty ID of the event's replica."),
+    ]
+    seq: Annotated[
+        int,
+        Field(
+            strict=True,
+            ge=1,
+            description="Per-replica sequence number, starting at 1.",
+        ),
+    ]
+
+
+class RelationRequest(BaseModel):
+    """The two events whose causal relation is explained.
+
+    The relation is directional: ``first`` relative to ``second``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    first: EventRef
+    second: EventRef
 
 
 # ---------------------------------------------------------------------------
@@ -1233,6 +1289,135 @@ def build_evidence_batch(
     return batch
 
 
+def _causal_chain(
+    replica_ids: list[str],
+    events: list[Event],
+    earlier: Event,
+    later: Event,
+) -> list[dict]:
+    """Shortest direct-dependency chain from ``earlier`` to ``later``.
+
+    Every step follows one direct-dependency edge (the previous event on the
+    same replica, or the event another replica's non-zero clock component
+    points at), so each listed event directly depends on its predecessor.
+    Among all chains with the fewest edges, the lexicographically smallest
+    (replica_id, seq) sequence is returned, with seq compared numerically.
+    A committed history is causally closed, so ``later`` always reaches
+    ``earlier`` through these edges when ``earlier``'s clock is smaller.
+    """
+
+    by_id = {(ev.replica_id, ev.seq): ev for ev in events}
+    later_id = (later.replica_id, later.seq)
+
+    # Fewest edges from each event to `later`: BFS backwards over dependency
+    # edges from `later`; every one of its ancestors gets its shortest
+    # distance (first discovery is a shortest path in an unweighted graph).
+    dist: dict[tuple[str, int], int] = {later_id: 0}
+    queue: deque[tuple[str, int]] = deque([later_id])
+    while queue:
+        ident = queue.popleft()
+        for dep in _direct_dependencies(by_id[ident], replica_ids):
+            if dep not in dist:
+                dist[dep] = dist[ident] + 1
+                queue.append(dep)
+
+    # Forward adjacency: identity -> events that directly depend on it.
+    dependents: dict[tuple[str, int], list[tuple[str, int]]] = {}
+    for ev in events:
+        for dep in _direct_dependencies(ev, replica_ids):
+            dependents.setdefault(dep, []).append((ev.replica_id, ev.seq))
+
+    # Every shortest chain has dist(earlier) edges, and from any node on one,
+    # any dependent that still reaches `later` in the remaining edges extends
+    # some shortest chain -- so greedily picking the smallest such dependent
+    # at every position yields the lexicographically smallest sequence.
+    start = (earlier.replica_id, earlier.seq)
+    chain = [start]
+    current = start
+    while current != later_id:
+        current = min(
+            nxt
+            for nxt in dependents.get(current, ())
+            if dist.get(nxt) == dist[current] - 1
+        )
+        chain.append(current)
+    return [{"replica_id": rid, "seq": seq} for rid, seq in chain]
+
+
+def explain_relation(
+    replica_ids: list[str],
+    events: list[Event],
+    first: EventRef,
+    second: EventRef,
+) -> dict:
+    """Causal relation between two events of one committed history.
+
+    The direction is ``first`` relative to ``second``: ``before``/``after``
+    carry the identifier chain from the earlier to the later event (each
+    event directly depending on its predecessor; fewest edges, then the
+    lexicographically smallest (replica_id, seq) sequence); ``concurrent``
+    carries an empty chain plus, for each side, one component where its own
+    clock exceeds the other side's (smallest replica ID when several
+    qualify) with both values; ``same`` carries a single-node chain.  An
+    unknown (replica_id, seq) raises EventNotFound (-> 404).
+    """
+
+    by_id = {(ev.replica_id, ev.seq): ev for ev in events}
+    a = by_id.get((first.replica_id, first.seq))
+    if a is None:
+        raise EventNotFound(first.replica_id, first.seq)
+    b = by_id.get((second.replica_id, second.seq))
+    if b is None:
+        raise EventNotFound(second.replica_id, second.seq)
+
+    if (a.replica_id, a.seq) == (b.replica_id, b.seq):
+        return {
+            "relation": "same",
+            "chain": [{"replica_id": a.replica_id, "seq": a.seq}],
+        }
+
+    _, a_lt_b = _clock_le(a.clock, b.clock, replica_ids)
+    _, b_lt_a = _clock_le(b.clock, a.clock, replica_ids)
+
+    if a_lt_b:
+        return {
+            "relation": "before",
+            "chain": _causal_chain(replica_ids, events, a, b),
+        }
+    if b_lt_a:
+        return {
+            "relation": "after",
+            "chain": _causal_chain(replica_ids, events, b, a),
+        }
+
+    # Concurrent: neither clock is componentwise <= the other (distinct
+    # events of a validated history never carry equal clocks, so each side
+    # strictly exceeds the other on at least one component).  Cite, per
+    # side, the smallest replica ID where its own clock is greater.
+    first_greater = min(
+        rid for rid in replica_ids if a.clock[rid] > b.clock[rid]
+    )
+    second_greater = min(
+        rid for rid in replica_ids if b.clock[rid] > a.clock[rid]
+    )
+    return {
+        "relation": "concurrent",
+        "chain": [],
+        "evidence": {
+            "first_greater": {
+                "replica_id": first_greater,
+                "first": a.clock[first_greater],
+                "second": b.clock[first_greater],
+            },
+            "second_greater": {
+                "replica_id": second_greater,
+                "first": a.clock[second_greater],
+                "second": b.clock[second_greater],
+            },
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Conflict resolution event
 # ---------------------------------------------------------------------------
@@ -1899,6 +2084,39 @@ def extract_history_evidence_batch(
         "replica_ids": list(replica_ids),
         "events": _canonical_events(batch, replica_ids),
     }
+
+
+@app.post(
+    "/api/histories/{history_id}/relation",
+    tags=["histories"],
+    response_model=None,
+)
+def explain_history_relation(history_id: str, body: RelationRequest) -> dict:
+    """Explain the causal relation between two events of one history.
+
+    Read-only: the stored history is fetched as one committed snapshot and
+    never written back; staged import-session events are invisible.  The two
+    events are referenced by ``first``/``second`` (replica_id non-empty, seq
+    a positive integer -- booleans rejected) and may touch different keys.
+    The relation is directional (``first`` relative to ``second``):
+    ``before``/``after`` attach the identifier chain from the earlier to the
+    later event, where every event directly depends on its predecessor (the
+    previous event on its own replica, or the event another replica's
+    non-zero clock component points at) -- fewest edges first, ties broken
+    by the lexicographically smallest (replica_id, seq) sequence with seq
+    compared numerically.  ``concurrent`` returns an empty chain plus, for
+    each side, one clock component where its own clock exceeds the other
+    side's (smallest replica ID when several qualify) with both values;
+    ``same`` returns a single-node chain.  Unknown history or event -> 404;
+    illegal references -> 422.
+    """
+
+    row = store.get_history(history_id)
+    if row is None:
+        raise HistoryNotFound(history_id)
+    hid, replica_ids, events = _load_row(row)
+    relation = explain_relation(replica_ids, events, body.first, body.second)
+    return {"id": hid, **relation}
 
 
 @app.post(
